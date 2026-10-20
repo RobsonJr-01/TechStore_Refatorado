@@ -2,120 +2,46 @@ const ProductRepository = require("../repositories/ProductRepository");
 const OrderRepository = require("../repositories/OrderRepository");
 const NotificationService = require("./NotificationService");
 const Logger = require("../utils/Logger");
+const OrderValidator = require("./OrderValidator");
+const DiscountCalculator = require("./discounts/DiscountCalculator");
+const FreightCalculator = require("./freight/FreightCalculator");
+const PaymentProcessor = require("./payments/PaymentProcessor");
 
 class OrderService {
-  constructor() {
-    this.productRepository = new ProductRepository();
-    this.orderRepository = new OrderRepository();
-    this.notificationService = new NotificationService();
-    this.logger = new Logger();
+  constructor({
+    productRepository = new ProductRepository(),
+    orderRepository = new OrderRepository(),
+    notificationService = new NotificationService(),
+    logger = new Logger(),
+    validator = null,
+    discountCalculator = new DiscountCalculator(),
+    freightCalculator = new FreightCalculator(),
+    paymentProcessor = new PaymentProcessor()
+  } = {}) {
+    this.productRepository = productRepository;
+    this.orderRepository = orderRepository;
+    this.notificationService = notificationService;
+    this.logger = logger;
+    this.validator = validator || new OrderValidator(this.productRepository);
+    this.discountCalculator = discountCalculator;
+    this.freightCalculator = freightCalculator;
+    this.paymentProcessor = paymentProcessor;
   }
 
   process(order) {
     this.logger.info(`Iniciando processamento do pedido ${order.id}.`);
 
-    if (!order.customer) {
-      throw new Error("Cliente obrigatorio.");
-    }
+    this.validator.validate(order);
 
-    if (!order.customer.email || !order.customer.email.includes("@")) {
-      throw new Error("E-mail do cliente invalido.");
-    }
+    const subtotal = order.getSubtotal();
 
-    if (!order.items || order.items.length === 0) {
-      throw new Error("Pedido sem itens.");
-    }
+    let discount = this.discountCalculator.calculate(order, subtotal);
+    const freight = this.freightCalculator.calculate(order);
+    const paymentResult = this.paymentProcessor.process(order, subtotal);
 
-    for (const item of order.items) {
-      if (!item.product) {
-        throw new Error("Item sem produto.");
-      }
-
-      if (item.quantity <= 0) {
-        throw new Error("Quantidade invalida.");
-      }
-
-      const product = this.productRepository.findById(item.product.id);
-
-      if (!product) {
-        throw new Error(`Produto ${item.product.id} nao encontrado.`);
-      }
-
-      if (product.stock < item.quantity) {
-        throw new Error(`Estoque insuficiente para ${product.name}.`);
-      }
-    }
-
-    let subtotal = 0;
-
-    for (const item of order.items) {
-      subtotal += item.product.price * item.quantity;
-    }
-
-    let discount = 0;
-
-    if (order.customer.type === "vip") {
-      discount += subtotal * 0.08;
-    }
-
-    if (order.customer.type === "employee") {
-      discount += subtotal * 0.15;
-    }
-
-    if (order.couponCode === "TECH10") {
-      discount += subtotal * 0.1;
-    }
-
-    if (order.couponCode === "FRETEGRATIS") {
-      discount += 0;
-    }
-
-    if (subtotal > 8000) {
-      discount += 250;
-    }
-
-    let totalWeight = 0;
-
-    for (const item of order.items) {
-      totalWeight += item.product.weight * item.quantity;
-    }
-
-    let freight = 0;
-
-    if (order.customer.address.region === "sudeste") {
-      freight = 20 + totalWeight * 4;
-    } else if (order.customer.address.region === "sul") {
-      freight = 28 + totalWeight * 5;
-    } else if (order.customer.address.region === "centro-oeste") {
-      freight = 35 + totalWeight * 6;
-    } else if (order.customer.address.region === "nordeste") {
-      freight = 45 + totalWeight * 7;
-    } else if (order.customer.address.region === "norte") {
-      freight = 60 + totalWeight * 9;
-    } else {
-      freight = 50 + totalWeight * 8;
-    }
-
-    if (order.couponCode === "FRETEGRATIS") {
-      freight = 0;
-    }
-
-    let paymentFee = 0;
-    let paymentStatus = "pending";
-
-    if (order.paymentMethod === "pix") {
-      paymentStatus = "approved";
-      discount += subtotal * 0.03;
-    } else if (order.paymentMethod === "credit_card") {
-      if (order.installments > 1) {
-        paymentFee = subtotal * 0.025;
-      }
-      paymentStatus = "approved";
-    } else if (order.paymentMethod === "boleto") {
-      paymentStatus = "waiting_payment";
-    } else {
-      throw new Error("Forma de pagamento invalida.");
-    }
+    discount += paymentResult.discount;
+    const paymentFee = paymentResult.fee;
+    const paymentStatus = paymentResult.status;
 
     const total = Number((subtotal - discount + freight + paymentFee).toFixed(2));
 
@@ -123,21 +49,71 @@ class OrderService {
       throw new Error("Total do pedido invalido.");
     }
 
-    for (const item of order.items) {
-      this.productRepository.updateStock(item.product.id, item.quantity);
-    }
+    this.updateStock(order.items);
 
     order.status = paymentStatus === "approved" ? "confirmed" : "waiting_payment";
 
-    const orderSummary = {
+    const orderSummary = this.buildOrderSummary(
+      order,
+      subtotal,
+      discount,
+      freight,
+      paymentFee,
+      total
+    );
+
+    this.orderRepository.save(orderSummary);
+
+    this.notifyCustomer(order, total);
+    this.printSummary(order, subtotal, discount, freight, paymentFee, total);
+
+    return orderSummary;
+  }
+
+  updateStock(items) {
+    for (const item of items) {
+      const productId = typeof item.getProductId === "function"
+        ? item.getProductId()
+        : item.product.id;
+
+      this.productRepository.updateStock(productId, item.quantity);
+    }
+  }
+
+  notifyCustomer(order, total) {
+    if (order.status === "confirmed") {
+      this.notificationService.sendOrderConfirmation(order.customer, order.id, total);
+    } else {
+      this.logger.warn(`Pedido ${order.id} aguardando pagamento.`);
+    }
+  }
+
+  buildOrderSummary(order, subtotal, discount, freight, paymentFee, total) {
+    const customerName = typeof order.getCustomerName === "function"
+      ? order.getCustomerName()
+      : order.customer.name;
+
+    const customerEmail = typeof order.getCustomerEmail === "function"
+      ? order.getCustomerEmail()
+      : order.customer.email;
+
+    const city = typeof order.getDeliveryCity === "function"
+      ? order.getDeliveryCity()
+      : order.customer.address.city;
+
+    const state = typeof order.getDeliveryState === "function"
+      ? order.getDeliveryState()
+      : order.customer.address.state;
+
+    return {
       id: order.id,
-      customerName: order.customer.name,
-      customerEmail: order.customer.email,
-      city: order.customer.address.city,
-      state: order.customer.address.state,
+      customerName,
+      customerEmail,
+      city,
+      state,
       items: order.items.map((item) => ({
-        productId: item.product.id,
-        name: item.product.name,
+        productId: typeof item.getProductId === "function" ? item.getProductId() : item.product.id,
+        name: typeof item.getProductName === "function" ? item.getProductName() : item.product.name,
         quantity: item.quantity,
         subtotal: item.getSubtotal()
       })),
@@ -150,26 +126,30 @@ class OrderService {
       status: order.status,
       createdAt: order.createdAt
     };
+  }
 
-    this.orderRepository.save(orderSummary);
+  printSummary(order, subtotal, discount, freight, paymentFee, total) {
+    const customerName = typeof order.getCustomerName === "function"
+      ? order.getCustomerName()
+      : order.customer.name;
 
-    if (order.status === "confirmed") {
-      this.notificationService.sendOrderConfirmation(order.customer, order.id, total);
-    } else {
-      this.logger.warn(`Pedido ${order.id} aguardando pagamento.`);
-    }
+    const city = typeof order.getDeliveryCity === "function"
+      ? order.getDeliveryCity()
+      : order.customer.address.city;
+
+    const state = typeof order.getDeliveryState === "function"
+      ? order.getDeliveryState()
+      : order.customer.address.state;
 
     console.log("Resumo do pedido");
-    console.log(`Cliente: ${order.customer.name}`);
-    console.log(`Cidade: ${order.customer.address.city}/${order.customer.address.state}`);
+    console.log(`Cliente: ${customerName}`);
+    console.log(`Cidade: ${city}/${state}`);
     console.log(`Itens: ${order.getTotalItems()}`);
     console.log(`Subtotal: R$ ${subtotal.toFixed(2)}`);
     console.log(`Desconto: R$ ${discount.toFixed(2)}`);
     console.log(`Frete: R$ ${freight.toFixed(2)}`);
     console.log(`Taxas: R$ ${paymentFee.toFixed(2)}`);
     console.log(`Total: R$ ${total.toFixed(2)}`);
-
-    return orderSummary;
   }
 }
 
